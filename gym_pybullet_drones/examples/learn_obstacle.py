@@ -248,7 +248,7 @@ def run(
         curve_path = os.path.join(save_dir, "training_curve.png")
         plt.savefig(curve_path, dpi=150)
         print(f"[INFO] Training curve saved to {curve_path}")
-        plt.show()
+        plt.close()
 
     # ── load best model and evaluate ─────────────────────────────────────────
     best_path = os.path.join(save_dir, "best_model.zip")
