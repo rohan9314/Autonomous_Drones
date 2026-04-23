@@ -16,6 +16,9 @@ betaflight_sitl/
 # macOS users
 .DS_Store
 
+# Claude Code session memory
+.claude/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
