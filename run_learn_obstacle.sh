@@ -17,4 +17,4 @@ mkdir -p logs
 python gym_pybullet_drones/examples/learn_obstacle.py \
     --n_envs 8 \
     --total_timesteps 5e6 \
-    --output_folder /nobackup/users/eybo/drone-results
+    --output_folder ~/drone-results
