@@ -228,27 +228,42 @@ class ObstacleAviary(BaseRLAviary):
     # ------------------------------------------------------------------
 
     def _computeReward(self):
-        """Progress reward: positive when closing distance to goal.
+        """Progress reward + smooth proximity penalty + crash penalty.
 
-        r_progress = dist_prev − dist_curr   (positive → approaching goal)
-        r_crash    = −3 on contact           (keeps obstacles genuinely costly)
+        r_progress  = dist_prev − dist_curr   (positive → approaching goal)
+        r_proximity = smooth quadratic repulsion rising inside PROX_RADIUS of
+                      each obstacle (non-zero gradient before contact, so the
+                      policy can learn avoidance rather than only reacting to
+                      a binary cliff at impact)
+        r_crash     = −3 on contact           (keeps obstacles genuinely costly)
 
-        Hovering yields exactly 0; crashing is only −3 plus lost future
-        progress — no longer worth doing deliberately.
+        Hovering yields exactly 0; crashing is penalised by both the smooth
+        term AND the hard crash penalty.
         """
+        # reward-design-agent: smooth_proximity_penalty
+        PROX_RADIUS = 0.40   # metres — penalty is zero beyond this distance
+        PROX_SCALE  = 2.0    # peak penalty magnitude at contact
+
         state     = self._getDroneStateVector(0)
         curr_dist = float(np.linalg.norm(self.TARGET_POS - state[0:3]))
 
         r_progress     = self.prev_dist - curr_dist
         self.prev_dist = curr_dist
 
-        r_crash = 0.0
+        r_proximity = 0.0
+        r_crash     = 0.0
         for oid in self.obstacle_ids:
+            obs_pos, _ = p.getBasePositionAndOrientation(oid, physicsClientId=self.CLIENT)
+            dist_to_obs = float(np.linalg.norm(state[0:3] - np.array(obs_pos)))
+            if dist_to_obs < PROX_RADIUS:
+                # Quadratic: 0 at PROX_RADIUS, −PROX_SCALE at dist=0
+                fraction    = 1.0 - dist_to_obs / PROX_RADIUS
+                r_proximity -= PROX_SCALE * fraction ** 2
             if p.getContactPoints(self.DRONE_IDS[0], oid, physicsClientId=self.CLIENT):
                 r_crash = -3.0
                 break
 
-        return r_progress + r_crash
+        return r_progress + r_proximity + r_crash
 
     # ------------------------------------------------------------------
     # Termination / truncation
