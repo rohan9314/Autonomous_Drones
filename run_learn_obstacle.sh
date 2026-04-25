@@ -8,8 +8,9 @@
 #SBATCH --mem=16G
 #SBATCH --partition=mit_normal
 
-module load anaconda3
-conda activate drones
+module load deprecated-modules
+module load anaconda3/2022.05-x86_64
+source activate drones
 
 cd ~/gym-pybullet-drones
 mkdir -p logs
