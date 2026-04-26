@@ -213,6 +213,7 @@ def run(
         gae_lambda=0.95,      # GAE smoothing parameter
         clip_range=0.2,       # PPO clip; limits how much the policy can change per step
         ent_coef=0.01,        # entropy bonus: keeps policy exploring, prevents premature collapse
+        target_kl=0.01,       # early-stop gradient updates if KL diverges; prevents policy collapse
         verbose=1,
         tensorboard_log=tb_log,
     )
