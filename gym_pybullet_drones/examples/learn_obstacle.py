@@ -1,10 +1,11 @@
 """Training script for ObstacleAviary: fly from origin to goal while avoiding obstacles.
 
-Four-phase curriculum:
+Five-phase curriculum:
   difficulty=0  no obstacles, straight flight (learn basic navigation)
-  difficulty=1  one obstacle off the direct path (easy avoidance)
-  difficulty=2  one obstacle on the direct path (forced detour)
-  difficulty=3  two obstacles in the corridor, randomised each episode
+  difficulty=1  one obstacle 0.10 m off path (easy, narrow miss)
+  difficulty=2  one obstacle 0.05 m off path (nearly centred, small gap)
+  difficulty=3  one obstacle dead-centre on path (forced real detour)
+  difficulty=4  two obstacles in the corridor, randomised each episode
 
 Usage
 -----
@@ -44,10 +45,11 @@ DEFAULT_N_ENVS         = 4
 # Reward thresholds that trigger a difficulty advance.
 # Calibrated for progress-based reward with PID action type.
 # A perfect episode scores ≈ 1.345 (start→goal Euclidean distance).
-# Phase 0 → 1: drone reaches goal reliably in open space    (~82% optimal)
-# Phase 1 → 2: reaches goal around the off-path obstacle    (~67% optimal)
-# Phase 2 → 3: routes around the on-path obstacle           (~52% optimal)
-CURRICULUM_THRESHOLDS = {0: 1.1, 1: 0.9, 2: 0.7}
+# Phase 0 → 1: drone reaches goal reliably in open space          (~82% optimal)
+# Phase 1 → 2: reaches goal around the barely-off-path obstacle   (~74% optimal)
+# Phase 2 → 3: reaches goal around the nearly-centred obstacle    (~67% optimal)
+# Phase 3 → 4: routes around the dead-centre obstacle             (~52% optimal)
+CURRICULUM_THRESHOLDS = {0: 1.1, 1: 0.9, 2: 0.8, 3: 0.7}
 
 
 # ── curriculum callback ────────────────────────────────────────────────────────
@@ -73,9 +75,18 @@ class CurriculumCallback(BaseCallback):
         self.eval_results          = []           # [(timestep, mean_reward), ...]
         self.stability_window      = stability_window
         self.evals_above_threshold = 0            # consecutive evals that beat threshold
+        self._explore_steps_left   = 0            # steps remaining at boosted entropy
 
     # called every training step
     def _on_step(self) -> bool:
+        # decay entropy boost after a phase transition
+        if self._explore_steps_left > 0:
+            self._explore_steps_left -= 1
+            if self._explore_steps_left == 0:
+                self.model.ent_coef = 0.01
+                if self.verbose:
+                    print("[Curriculum] Entropy boost expired, ent_coef → 0.01")
+
         if self.n_calls % self.eval_freq != 0:
             return True
 
@@ -127,14 +138,17 @@ class CurriculumCallback(BaseCallback):
                 os.path.join(self.save_path, f"model_phase_{self.difficulty - 1}_complete")
             )
 
-            # Reset Adam optimizer momentum and set LR to a fixed fine-tuning rate.
-            # Using *= 0.5 would compound across transitions (1e-4→5e-5→2.5e-5),
-            # leaving the policy unable to adapt in later phases.
-            self.model.policy.optimizer.state.clear()
+            # Restore LR to base rate (don't drop to 5e-5 — the policy needs
+            # full step-size to re-explore when the obstacle layout changes).
+            # Keep Adam state intact so accumulated momentum carries over.
             for g in self.model.policy.optimizer.param_groups:
-                g["lr"] = 5e-5
+                g["lr"] = 1e-4
+            # Spike entropy for 300K steps so the policy actively explores
+            # detour paths around the new (harder) obstacle configuration.
+            self.model.ent_coef = 0.05
+            self._explore_steps_left = 300_000
             if self.verbose:
-                print(f"[Curriculum] Optimizer state cleared, LR → 5e-05")
+                print(f"[Curriculum] LR → 1e-04, ent_coef → 0.05 for 300K steps")
 
         return True  # returning False would stop training early
 
@@ -234,8 +248,8 @@ def run(
         steps, rewards = zip(*curriculum_cb.eval_results)
         plt.figure(figsize=(9, 4))
         plt.plot(steps, rewards, marker="o", markersize=3, linewidth=1)
-        colours = ["orange", "red", "darkred"]
-        labels  = ["phase 0→1", "phase 1→2", "phase 2→3"]
+        colours = ["orange", "goldenrod", "red", "darkred"]
+        labels  = ["phase 0→1", "phase 1→2", "phase 2→3", "phase 3→4"]
         for (phase, thresh), colour, label in zip(CURRICULUM_THRESHOLDS.items(), colours, labels):
             plt.axhline(thresh, color=colour, linestyle="--",
                         label=f"{label} threshold ({thresh})")
