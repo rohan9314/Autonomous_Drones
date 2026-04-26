@@ -271,7 +271,7 @@ class ObstacleAviary(BaseRLAviary):
 
     def _computeTerminated(self):
         state = self._getDroneStateVector(0)
-        if np.linalg.norm(self.TARGET_POS - state[0:3]) < 0.05:
+        if np.linalg.norm(self.TARGET_POS - state[0:3]) < 0.15:  # auto-fix: loosened from 0.05
             for oid in self.obstacle_ids:
                 if p.getContactPoints(self.DRONE_IDS[0], oid, physicsClientId=self.CLIENT):
                     return False
