@@ -138,17 +138,13 @@ class CurriculumCallback(BaseCallback):
                 os.path.join(self.save_path, f"model_phase_{self.difficulty - 1}_complete")
             )
 
-            # Restore LR to base rate (don't drop to 5e-5 — the policy needs
-            # full step-size to re-explore when the obstacle layout changes).
-            # Keep Adam state intact so accumulated momentum carries over.
+            # Restore LR to base rate; keep Adam state intact so momentum carries over.
+            # Entropy boost removed: ent_coef=0.05 caused policy collapse at diff 2
+            # by making the policy too stochastic, overwhelming the avoidance gradient.
             for g in self.model.policy.optimizer.param_groups:
                 g["lr"] = 1e-4
-            # Spike entropy for 300K steps so the policy actively explores
-            # detour paths around the new (harder) obstacle configuration.
-            self.model.ent_coef = 0.05
-            self._explore_steps_left = 300_000
             if self.verbose:
-                print(f"[Curriculum] LR → 1e-04, ent_coef → 0.05 for 300K steps")
+                print(f"[Curriculum] LR → 1e-04")
 
         return True  # returning False would stop training early
 
@@ -161,6 +157,7 @@ def run(
     gui=DEFAULT_GUI,
     total_timesteps=DEFAULT_TOTAL_STEPS,
     n_envs=DEFAULT_N_ENVS,
+    load_model=None,
 ):
     # ── output directory ──────────────────────────────────────────────────────
     timestamp = datetime.now().strftime("%m.%d.%Y_%H.%M.%S")
@@ -202,21 +199,31 @@ def run(
         tb_log = None
         print("[WARN] tensorboard not installed — skipping TB logging. Install with: pip install tensorboard")
 
-    model = PPO(
-        "MlpPolicy",
-        train_env,
-        n_steps=512,          # each env collects 512 steps → 512*n_envs samples/update
-        batch_size=128,
-        n_epochs=10,
-        learning_rate=1e-4,   # lowered from 3e-4: smaller steps stay near good regions longer
-        gamma=0.99,           # discount factor — future rewards matter
-        gae_lambda=0.95,      # GAE smoothing parameter
-        clip_range=0.2,       # PPO clip; limits how much the policy can change per step
-        ent_coef=0.01,        # entropy bonus: keeps policy exploring, prevents premature collapse
-        target_kl=0.01,       # early-stop gradient updates if KL diverges; prevents policy collapse
-        verbose=1,
-        tensorboard_log=tb_log,
-    )
+    if load_model:
+        print(f"[INFO] Loading model from checkpoint: {load_model}")
+        vec_norm_path = os.path.join(os.path.dirname(load_model), "vec_normalize.pkl")
+        if os.path.exists(vec_norm_path):
+            print(f"[INFO] Loading VecNormalize stats from: {vec_norm_path}")
+            train_env = VecNormalize.load(vec_norm_path, train_env.venv)
+            train_env.training = True
+        model = PPO.load(load_model, env=train_env, tensorboard_log=tb_log)
+        model.target_kl = 0.01
+    else:
+        model = PPO(
+            "MlpPolicy",
+            train_env,
+            n_steps=512,
+            batch_size=128,
+            n_epochs=10,
+            learning_rate=1e-4,
+            gamma=0.99,
+            gae_lambda=0.95,
+            clip_range=0.2,
+            ent_coef=0.01,
+            target_kl=0.01,
+            verbose=1,
+            tensorboard_log=tb_log,
+        )
 
     # ── curriculum callback ───────────────────────────────────────────────────
     # eval_freq=2000 means we evaluate every 2000 *calls to _on_step*,
@@ -330,5 +337,6 @@ if __name__ == "__main__":
     parser.add_argument("--gui",               default=DEFAULT_GUI,           type=str2bool, metavar="")
     parser.add_argument("--total_timesteps",   default=DEFAULT_TOTAL_STEPS,   type=float,    metavar="")
     parser.add_argument("--n_envs",            default=DEFAULT_N_ENVS,        type=int,      metavar="")
+    parser.add_argument("--load_model",        default=None,                  type=str,      metavar="")
     args = parser.parse_args()
     run(**vars(args))
