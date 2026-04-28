@@ -17,5 +17,8 @@ mkdir -p logs
 
 python gym_pybullet_drones/examples/learn_obstacle.py \
     --n_envs 8 \
-    --total_timesteps 5e6 \
+    --total_timesteps 6000000 \
+    --difficulty 3 \
+    --load_model /home/eybo/drone-results/obstacle-04.27.2026_21.37.47/best_model.zip \
+    --learning_rate 3e-5 \
     --output_folder ~/drone-results

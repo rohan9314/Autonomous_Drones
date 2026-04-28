@@ -158,6 +158,7 @@ def run(
     total_timesteps=DEFAULT_TOTAL_STEPS,
     n_envs=DEFAULT_N_ENVS,
     load_model=None,
+    learning_rate=None,
 ):
     # ── output directory ──────────────────────────────────────────────────────
     timestamp = datetime.now().strftime("%m.%d.%Y_%H.%M.%S")
@@ -208,6 +209,10 @@ def run(
             train_env.training = True
         model = PPO.load(load_model, env=train_env, tensorboard_log=tb_log)
         model.target_kl = 0.01
+        if learning_rate is not None:
+            for g in model.policy.optimizer.param_groups:
+                g["lr"] = learning_rate
+            print(f"[INFO] Overriding LR → {learning_rate}")
     else:
         model = PPO(
             "MlpPolicy",
@@ -215,7 +220,7 @@ def run(
             n_steps=512,
             batch_size=128,
             n_epochs=10,
-            learning_rate=1e-4,
+            learning_rate=learning_rate if learning_rate is not None else 1e-4,
             gamma=0.99,
             gae_lambda=0.95,
             clip_range=0.2,
@@ -338,5 +343,6 @@ if __name__ == "__main__":
     parser.add_argument("--total_timesteps",   default=DEFAULT_TOTAL_STEPS,   type=float,    metavar="")
     parser.add_argument("--n_envs",            default=DEFAULT_N_ENVS,        type=int,      metavar="")
     parser.add_argument("--load_model",        default=None,                  type=str,      metavar="")
+    parser.add_argument("--learning_rate",     default=None,                  type=float,    metavar="")
     args = parser.parse_args()
     run(**vars(args))

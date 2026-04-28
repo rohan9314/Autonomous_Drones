@@ -17,7 +17,7 @@ class HoverAviary(BaseRLAviary):
                  gui=True,
                  record=False,
                  obs: ObservationType = ObservationType.KIN,
-                 act: ActionType = ActionType.POS
+                 act: ActionType = ActionType.PID
                  ):
 
         self.EPISODE_LEN_SEC = 6
