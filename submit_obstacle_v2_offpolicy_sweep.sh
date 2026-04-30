@@ -15,7 +15,7 @@ for i in "${!ALGOS[@]}"; do
     sbatch --job-name="${job_name}" \
       --output="logs/%x-%j.out" \
       --error="logs/%x-%j.err" \
-      --time=24:00:00 \
+      --time=12:00:00 \
       --ntasks=1 \
       --cpus-per-task=8 \
       --mem=24G \

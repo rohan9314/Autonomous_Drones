@@ -17,6 +17,8 @@ SEEDS="0 1 2"
 DRY_RUN=0
 PROMOTE_BEST=0
 DEPLOY_ROOT="${RESULTS_DIR}/deploy"
+SLURM_TIME="12:00:00"
+SLURM_PARTITION="mit_normal"
 
 usage() {
   cat <<EOF
@@ -31,6 +33,8 @@ Usage: $0 [options]
   --dry_run true|false
   --promote_best true|false
   --deploy_root PATH
+  --slurm_time HH:MM:SS   (default ${SLURM_TIME}; ORCD mit_normal often caps below 24h)
+  --partition NAME        (default ${SLURM_PARTITION})
 EOF
 }
 
@@ -56,6 +60,8 @@ while [[ $# -gt 0 ]]; do
     --dry_run) DRY_RUN="$(to_bool "$2")"; shift 2 ;;
     --promote_best) PROMOTE_BEST="$(to_bool "$2")"; shift 2 ;;
     --deploy_root) DEPLOY_ROOT="$2"; shift 2 ;;
+    --slurm_time) SLURM_TIME="$2"; shift 2 ;;
+    --partition) SLURM_PARTITION="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown arg: $1" >&2; usage; exit 1 ;;
   esac
@@ -109,11 +115,11 @@ submit_one() {
   out=$(sbatch --job-name="${job_name}" \
     --output="logs/%x-%j.out" \
     --error="logs/%x-%j.err" \
-    --time=24:00:00 \
+    --time="${SLURM_TIME}" \
     --ntasks=1 \
     --cpus-per-task=8 \
     --mem=24G \
-    --partition=mit_normal \
+    --partition="${SLURM_PARTITION}" \
     --wrap="${cmd}")
 
   echo "${out}" | tee -a "${SUBMISSION_LOG}"
