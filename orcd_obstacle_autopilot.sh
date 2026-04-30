@@ -2,10 +2,14 @@
 set -euo pipefail
 
 # ORCD autopilot:
-# 1) submit SAC/TD3 sweeps
+# 1) submit SAC/TD3 sweeps (optional: chained SLURM jobs that resume after each segment)
 # 2) poll until all jobs finish
 # 3) run leaderboard evaluation
 # 4) write best-checkpoint pointer JSON for deployment/testing
+#
+# Chaining: use --chain_segments N (N>1). Each segment runs --segment_timesteps steps (default:
+# total_timesteps/N) in a fixed --run_dir; segment 2+ uses --resume_latest. Dependencies use
+# afterany so a wall-timeout still queues the next segment. Pair with --slurm_time 12:00:00.
 
 TASK="v3"
 RESULTS_DIR="${HOME}/drone-results"
@@ -19,6 +23,8 @@ PROMOTE_BEST=0
 DEPLOY_ROOT="${RESULTS_DIR}/deploy"
 SLURM_TIME="12:00:00"
 SLURM_PARTITION="mit_normal"
+CHAIN_SEGMENTS=1
+SEGMENT_TIMESTEPS=""
 
 usage() {
   cat <<EOF
@@ -35,6 +41,8 @@ Usage: $0 [options]
   --deploy_root PATH
   --slurm_time HH:MM:SS   (default ${SLURM_TIME}; ORCD mit_normal often caps below 24h)
   --partition NAME        (default ${SLURM_PARTITION})
+  --chain_segments INT    (default 1 = single job per combo; use 6 with 12h wall + resume)
+  --segment_timesteps INT (optional; default total_timesteps/chain_segments)
 EOF
 }
 
@@ -62,6 +70,8 @@ while [[ $# -gt 0 ]]; do
     --deploy_root) DEPLOY_ROOT="$2"; shift 2 ;;
     --slurm_time) SLURM_TIME="$2"; shift 2 ;;
     --partition) SLURM_PARTITION="$2"; shift 2 ;;
+    --chain_segments) CHAIN_SEGMENTS="$2"; shift 2 ;;
+    --segment_timesteps) SEGMENT_TIMESTEPS="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown arg: $1" >&2; usage; exit 1 ;;
   esac
@@ -69,6 +79,11 @@ done
 
 if [[ "$TASK" != "v2" && "$TASK" != "v3" ]]; then
   echo "--task must be v2 or v3" >&2
+  exit 1
+fi
+
+if ! [[ "${CHAIN_SEGMENTS}" =~ ^[0-9]+$ ]] || [[ "${CHAIN_SEGMENTS}" -lt 1 ]]; then
+  echo "--chain_segments must be a positive integer" >&2
   exit 1
 fi
 
@@ -94,6 +109,20 @@ if [[ "$TASK" == "v2" ]]; then
   TIMESTEPS=8000000
 else
   TIMESTEPS=12000000
+fi
+
+if [[ "${CHAIN_SEGMENTS}" -gt 1 ]]; then
+  if [[ -z "${SEGMENT_TIMESTEPS}" ]]; then
+    SEGMENT_TIMESTEPS=$((TIMESTEPS / CHAIN_SEGMENTS))
+  fi
+  echo "[INFO] Chained training: chain_segments=${CHAIN_SEGMENTS} segment_timesteps=${SEGMENT_TIMESTEPS} (budget ${TIMESTEPS})" | tee -a "${SUBMISSION_LOG}"
+  {
+    echo "task=${TASK}"
+    echo "timesteps_total=${TIMESTEPS}"
+    echo "chain_segments=${CHAIN_SEGMENTS}"
+    echo "segment_timesteps=${SEGMENT_TIMESTEPS}"
+    echo "slurm_time=${SLURM_TIME}"
+  } > "${AUTOPILOT_DIR}/chain_config.txt"
 fi
 
 echo "[INFO] Autopilot dir: ${AUTOPILOT_DIR}" | tee -a "${SUBMISSION_LOG}"
@@ -131,16 +160,87 @@ submit_one() {
   echo "${job_id}" >> "${JOB_IDS_FILE}"
 }
 
-for algo in "${ALGOS[@]}"; do
-  if [[ "$algo" == "sac" ]]; then
-    lr="2e-4"
-  else
-    lr="1e-4"
+submit_chain_segment() {
+  local algo="$1"
+  local lr="$2"
+  local seed="$3"
+  local seg="$4"
+  local run_dir="$5"
+  local dep_job="$6"
+  local job_name="drone-${TASK}-${algo}-s${seed}-c${seg}"
+  local train_script="gym_pybullet_drones/examples/learn_obstacle_${TASK}_offpolicy.py"
+  local resume_args=""
+  local ls_val="20000"
+  if [[ "${seg}" -gt 1 ]]; then
+    resume_args="--resume_latest true"
+    ls_val="0"
   fi
-  for seed in ${SEEDS}; do
-    submit_one "${algo}" "${lr}" "${seed}"
+  local cmd="module load deprecated-modules && module load anaconda3/2022.05-x86_64 && source activate drones && cd ~/gym-pybullet-drones && python ${train_script} --algo ${algo} --difficulty 1 --n_envs 8 --total_timesteps ${SEGMENT_TIMESTEPS} --batch_size 1024 --buffer_size 1000000 --learning_starts ${ls_val} --learning_rate ${lr} --net_arch 512,512,256 --output_folder ${RESULTS_DIR} --run_dir ${run_dir} ${resume_args} && echo AUTOPILOT_DONE"
+
+  local sbatch_dep=()
+  if [[ -n "${dep_job}" ]]; then
+    sbatch_dep+=(--dependency=afterany:"${dep_job}")
+  fi
+
+  if [[ "${DRY_RUN}" == "1" ]]; then
+    echo "[DRY_RUN] job=${job_name} dep=${dep_job} sbatch ${sbatch_dep[*]:+${sbatch_dep[*]}} --wrap='${cmd}'" | tee -a "${SUBMISSION_LOG}"
+    echo ""
+    return 0
+  fi
+
+  local out
+  out=$(sbatch "${sbatch_dep[@]}" --job-name="${job_name}" \
+    --output="logs/%x-%j.out" \
+    --error="logs/%x-%j.err" \
+    --time="${SLURM_TIME}" \
+    --ntasks=1 \
+    --cpus-per-task=8 \
+    --mem=24G \
+    --partition="${SLURM_PARTITION}" \
+    --wrap="${cmd}")
+
+  echo "${out}" | tee -a "${SUBMISSION_LOG}"
+  local job_id
+  job_id=$(echo "${out}" | awk '{print $4}')
+  if [[ -z "${job_id}" ]]; then
+    echo "[ERROR] Could not parse job ID from sbatch output: ${out}" >&2
+    exit 1
+  fi
+  echo "${job_id}" >> "${JOB_IDS_FILE}"
+  echo "${job_id}"
+}
+
+CHAIN_TAG="$(basename "${AUTOPILOT_DIR}")"
+
+if [[ "${CHAIN_SEGMENTS}" -gt 1 ]]; then
+  for algo in "${ALGOS[@]}"; do
+    if [[ "$algo" == "sac" ]]; then
+      lr="2e-4"
+    else
+      lr="1e-4"
+    fi
+    for seed in ${SEEDS}; do
+      run_dir="${RESULTS_DIR}/obstacle_${TASK}_${algo}_seed${seed}__${CHAIN_TAG}"
+      mkdir -p "${run_dir}"
+      echo "${run_dir}" >> "${AUTOPILOT_DIR}/chain_run_dirs.txt"
+      prev_job=""
+      for seg in $(seq 1 "${CHAIN_SEGMENTS}"); do
+        prev_job=$(submit_chain_segment "${algo}" "${lr}" "${seed}" "${seg}" "${run_dir}" "${prev_job}")
+      done
+    done
   done
-done
+else
+  for algo in "${ALGOS[@]}"; do
+    if [[ "$algo" == "sac" ]]; then
+      lr="2e-4"
+    else
+      lr="1e-4"
+    fi
+    for seed in ${SEEDS}; do
+      submit_one "${algo}" "${lr}" "${seed}"
+    done
+  done
+fi
 
 if [[ "${DRY_RUN}" == "1" ]]; then
   echo "[INFO] Dry run complete. No jobs submitted."
@@ -156,7 +256,7 @@ while [[ "${all_done}" == "0" ]]; do
   ts="$(date +%Y-%m-%dT%H:%M:%S)"
   while read -r jid; do
     [[ -z "${jid}" ]] && continue
-    if squeue -j "${jid}" -h | rg -q .; then
+    if squeue -j "${jid}" -h | grep -q .; then
       remaining=$((remaining + 1))
     fi
   done < "${JOB_IDS_FILE}"

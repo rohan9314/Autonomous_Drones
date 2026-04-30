@@ -4,14 +4,17 @@ V3 is the multi-waypoint task; curriculum is based on mean fraction completed.
 """
 
 import argparse
+import glob
+import json
 import os
+import re
 from collections import deque
 from datetime import datetime
 
 import matplotlib.pyplot as plt
 import numpy as np
 from stable_baselines3 import SAC, TD3
-from stable_baselines3.common.callbacks import BaseCallback
+from stable_baselines3.common.callbacks import BaseCallback, CheckpointCallback
 from stable_baselines3.common.env_util import make_vec_env
 from stable_baselines3.common.vec_env import VecNormalize
 
@@ -38,12 +41,23 @@ RETREAT_CONSEC = 2
 MAX_DIFFICULTY = 4
 
 
+CURRICULUM_STATE_NAME = "curriculum_state.json"
+
+
 class FractionCurriculumCallback(BaseCallback):
     def __init__(self, eval_freq, save_path, starting_difficulty=1, max_difficulty=MAX_DIFFICULTY, verbose=1):
         super().__init__(verbose)
         self.eval_freq = eval_freq
         self.save_path = save_path
+        self.state_path = os.path.join(save_path, CURRICULUM_STATE_NAME)
         self.difficulty = starting_difficulty
+        if os.path.isfile(self.state_path):
+            try:
+                with open(self.state_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                self.difficulty = int(data.get("difficulty", starting_difficulty))
+            except (OSError, ValueError, json.JSONDecodeError):
+                pass
         self.max_difficulty = max_difficulty
         self.best_mean_fraction = 0.0
         self.episode_fractions = deque(maxlen=300)
@@ -51,6 +65,13 @@ class FractionCurriculumCallback(BaseCallback):
         self.consec_below = 0
         self.plot_data = []
         self.transitions = []
+
+    def _persist_difficulty(self):
+        try:
+            with open(self.state_path, "w", encoding="utf-8") as f:
+                json.dump({"difficulty": self.difficulty}, f)
+        except OSError:
+            pass
 
     def _on_step(self) -> bool:
         dones = self.locals.get("dones", [])
@@ -95,12 +116,14 @@ class FractionCurriculumCallback(BaseCallback):
             self.training_env.set_attr("difficulty", self.difficulty)
             self.transitions.append((self.num_timesteps, old_diff, self.difficulty))
             self.model.save(os.path.join(self.save_path, f"model_diff{old_diff}_complete"))
+            self._persist_difficulty()
         elif self.consec_below >= RETREAT_CONSEC and self.difficulty > 0:
             self.consec_below = 0
             old_diff = self.difficulty
             self.difficulty -= 1
             self.training_env.set_attr("difficulty", self.difficulty)
             self.transitions.append((self.num_timesteps, old_diff, self.difficulty))
+            self._persist_difficulty()
         return True
 
 
@@ -146,6 +169,37 @@ def _build_model(algo, env, net_arch, learning_rate, buffer_size, learning_start
     raise ValueError(f"Unsupported algo: {algo}")
 
 
+def _read_start_difficulty(save_dir, default_difficulty):
+    path = os.path.join(save_dir, CURRICULUM_STATE_NAME)
+    if not os.path.isfile(path):
+        return default_difficulty
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return int(data.get("difficulty", default_difficulty))
+    except (OSError, ValueError, json.JSONDecodeError):
+        return default_difficulty
+
+
+def _resolve_resume_checkpoint(save_dir):
+    """Pick best checkpoint for resume: prefer final_model, then highest checkpoint_*, else best_model."""
+    candidates = []
+    final_p = os.path.join(save_dir, "final_model.zip")
+    if os.path.isfile(final_p):
+        candidates.append((10**18, final_p))
+    for p in glob.glob(os.path.join(save_dir, "checkpoint_*_steps.zip")):
+        m = re.search(r"checkpoint_(\d+)_steps\.zip$", os.path.basename(p))
+        if m:
+            candidates.append((int(m.group(1)), p))
+    if candidates:
+        candidates.sort(key=lambda x: x[0])
+        return candidates[-1][1]
+    best_p = os.path.join(save_dir, "best_model.zip")
+    if os.path.isfile(best_p):
+        return best_p
+    return None
+
+
 def _plot_curve(save_dir, cb):
     if not cb.plot_data:
         return
@@ -185,6 +239,9 @@ def run(
     learning_starts=DEFAULT_LEARNING_STARTS,
     net_arch=DEFAULT_NET_ARCH,
     learning_rate=None,
+    run_dir=None,
+    load_model=None,
+    resume_latest=False,
 ):
     _ = gui
     algo = algo.lower()
@@ -192,14 +249,24 @@ def run(
         raise ValueError("algo must be one of: sac, td3")
 
     net_arch_list = [int(x.strip()) for x in net_arch.split(",")] if isinstance(net_arch, str) else list(net_arch)
-    timestamp = datetime.now().strftime("%m.%d.%Y_%H.%M.%S")
-    save_dir = os.path.join(output_folder, f"obstacle_v3_{algo}-{timestamp}")
+    if run_dir:
+        save_dir = os.path.abspath(run_dir)
+    else:
+        timestamp = datetime.now().strftime("%m.%d.%Y_%H.%M.%S")
+        save_dir = os.path.join(output_folder, f"obstacle_v3_{algo}-{timestamp}")
     os.makedirs(save_dir, exist_ok=True)
     print(f"[INFO] Saving results to: {save_dir}")
 
+    ckpt_path = load_model
+    if resume_latest:
+        ckpt_path = _resolve_resume_checkpoint(save_dir)
+        if ckpt_path:
+            print(f"[INFO] resume_latest -> {ckpt_path}")
+    start_difficulty = _read_start_difficulty(save_dir, difficulty)
+
     train_env = make_vec_env(
         ObstacleAviaryV3,
-        env_kwargs=dict(obs=DEFAULT_OBS, act=DEFAULT_ACT, difficulty=difficulty),
+        env_kwargs=dict(obs=DEFAULT_OBS, act=DEFAULT_ACT, difficulty=start_difficulty),
         n_envs=n_envs,
         seed=0,
     )
@@ -211,19 +278,57 @@ def run(
     except ImportError:
         tb_log = None
 
-    model = _build_model(
-        algo=algo,
-        env=train_env,
-        net_arch=net_arch_list,
-        learning_rate=learning_rate,
-        buffer_size=buffer_size,
-        learning_starts=learning_starts,
-        batch_size=batch_size,
-        tb_log=tb_log,
+    loaded = False
+    if ckpt_path and os.path.isfile(ckpt_path):
+        vec_norm_path = os.path.join(os.path.dirname(ckpt_path), "vec_normalize.pkl")
+        if not os.path.isfile(vec_norm_path):
+            vec_norm_path = os.path.join(os.path.dirname(ckpt_path), "vec_normalize_final.pkl")
+        if os.path.isfile(vec_norm_path):
+            print(f"[INFO] Loading VecNormalize from {vec_norm_path}")
+            train_env = VecNormalize.load(vec_norm_path, train_env.venv)
+            train_env.training = True
+        print(f"[INFO] Loading checkpoint: {ckpt_path}")
+        if algo == "sac":
+            model = SAC.load(ckpt_path, env=train_env, tensorboard_log=tb_log)
+        else:
+            model = TD3.load(ckpt_path, env=train_env, tensorboard_log=tb_log)
+        if learning_rate is not None:
+            model.learning_rate = learning_rate
+        loaded = True
+    else:
+        if ckpt_path:
+            print(f"[WARN] Checkpoint path invalid or missing; training from scratch. ({ckpt_path})")
+        model = _build_model(
+            algo=algo,
+            env=train_env,
+            net_arch=net_arch_list,
+            learning_rate=learning_rate,
+            buffer_size=buffer_size,
+            learning_starts=learning_starts,
+            batch_size=batch_size,
+            tb_log=tb_log,
+        )
+
+    cb = FractionCurriculumCallback(
+        eval_freq=1000, save_path=save_dir, starting_difficulty=start_difficulty, verbose=1
+    )
+    train_env.set_attr("difficulty", cb.difficulty)
+    cb._persist_difficulty()
+
+    chk = CheckpointCallback(
+        save_freq=max(50_000 // max(n_envs, 1), 1000),
+        save_path=save_dir,
+        name_prefix="checkpoint",
+        save_replay_buffer=False,
+        save_vecnormalize=True,
     )
 
-    cb = FractionCurriculumCallback(eval_freq=1000, save_path=save_dir, starting_difficulty=difficulty, verbose=1)
-    model.learn(total_timesteps=int(total_timesteps), callback=cb, log_interval=50)
+    model.learn(
+        total_timesteps=int(total_timesteps),
+        callback=[cb, chk],
+        log_interval=50,
+        reset_num_timesteps=not loaded,
+    )
 
     model.save(os.path.join(save_dir, "final_model"))
     train_env.save(os.path.join(save_dir, "vec_normalize_final.pkl"))
@@ -263,5 +368,8 @@ if __name__ == "__main__":
     parser.add_argument("--learning_starts", default=DEFAULT_LEARNING_STARTS, type=int, metavar="")
     parser.add_argument("--net_arch", default=DEFAULT_NET_ARCH, type=str, metavar="")
     parser.add_argument("--learning_rate", default=None, type=float, metavar="")
+    parser.add_argument("--run_dir", default=None, type=str, metavar="", help="Fixed run directory for chained SLURM jobs.")
+    parser.add_argument("--load_model", default=None, type=str, metavar="", help="Path to .zip checkpoint to resume.")
+    parser.add_argument("--resume_latest", default=False, type=str2bool, metavar="", help="Resume from latest checkpoint in run_dir.")
     args = parser.parse_args()
     run(**vars(args))
