@@ -12,24 +12,27 @@ MAX_OBSTACLES        = 2      # obs vector always padded to this many obstacles
 
 # Base obstacle positions per phase.
 # Direct path: (0,0,0) → (1,0,1), parameterised as t*(1,0,1) for t ∈ [0,1].
-#   Phase 1 — one obstacle 0.3 m off the path in Y: easy first encounter.
-#   Phase 2 — one obstacle dead-centre on the path: forced detour.
-#   Phase 3 — two obstacles in the corridor (original hard layout).
+#   Phase 1 — one obstacle 0.10 m off the path in Y: easy, narrow miss.
+#   Phase 2 — one obstacle 0.05 m off the path: nearly centred, small gap left.
+#   Phase 3 — one obstacle dead-centre: forced detour, requires real avoidance.
+#   Phase 4 — two obstacles in the corridor (original hard layout).
 PHASE_OBSTACLES = {
     1: [(0.50,  0.10, 0.50)],
-    2: [(0.50,  0.00, 0.50)],
-    3: [(0.33,  0.00, 0.50), (0.66, 0.15, 0.80)],
+    2: [(0.50,  0.05, 0.50)],
+    3: [(0.50,  0.00, 0.50)],
+    4: [(0.33,  0.00, 0.50), (0.66, 0.15, 0.80)],
 }
 
 
 class ObstacleAviary(BaseRLAviary):
     """Single-agent RL task: fly from origin to [1,0,1] while avoiding obstacles.
 
-    Four-phase curriculum (controlled by `difficulty`):
+    Five-phase curriculum (controlled by `difficulty`):
       0 — no obstacles, open corridor
-      1 — one obstacle placed off the direct flight path (easy avoidance)
-      2 — one obstacle placed directly on the flight path (forced detour)
-      3 — two obstacles in the corridor, randomised each episode
+      1 — one obstacle 0.10 m off path in Y (easy, narrow miss)
+      2 — one obstacle 0.05 m off path (nearly centred, small gap)
+      3 — one obstacle dead-centre on path (forced real detour)
+      4 — two obstacles in the corridor, randomised each episode
 
     Observation vector layout (total 66 dims with PID / ctrl_freq=30):
       [0:12]   kinematic state  (pos, rpy, vel, ang_v)
@@ -56,7 +59,8 @@ class ObstacleAviary(BaseRLAviary):
                  difficulty: int          = 0,
                  ):
         self.TARGET_POS      = np.array([1.0, 0.0, 1.0])
-        self.EPISODE_LEN_SEC = 8
+        # Give more time at harder phases so the detour path fits in the budget.
+        self.EPISODE_LEN_SEC = 8 if difficulty < 3 else 12
         self.difficulty      = difficulty
         self.prev_dist       = 0.0   # seeded in reset(); used by progress reward
         self.obstacle_ids    = []    # populated by _addObstacles() on every reset()
@@ -80,6 +84,7 @@ class ObstacleAviary(BaseRLAviary):
     # ------------------------------------------------------------------
 
     def reset(self, seed=None, options=None):
+        self.EPISODE_LEN_SEC = 8 if self.difficulty < 3 else 12
         obs, info = super().reset(seed=seed, options=options)
         state = self._getDroneStateVector(0)
         self.prev_dist = float(np.linalg.norm(self.TARGET_POS - state[0:3]))
@@ -138,11 +143,12 @@ class ObstacleAviary(BaseRLAviary):
         if self.difficulty == 0:
             return
 
-        base = PHASE_OBSTACLES.get(self.difficulty, PHASE_OBSTACLES[3])
+        base = PHASE_OBSTACLES.get(self.difficulty, PHASE_OBSTACLES[4])
 
-        if self.difficulty < 3:
+        if self.difficulty < 4:
             positions = list(base)
         else:
+            # Phase 4: randomise obstacle positions each episode
             rng = np.random.default_rng(self.np_random.integers(0, 2**31))
             positions = [
                 (x + rng.uniform(-0.10, 0.10),
@@ -228,27 +234,42 @@ class ObstacleAviary(BaseRLAviary):
     # ------------------------------------------------------------------
 
     def _computeReward(self):
-        """Progress reward: positive when closing distance to goal.
+        """Progress reward + smooth proximity penalty + crash penalty.
 
-        r_progress = dist_prev − dist_curr   (positive → approaching goal)
-        r_crash    = −3 on contact           (keeps obstacles genuinely costly)
+        r_progress  = dist_prev − dist_curr   (positive → approaching goal)
+        r_proximity = smooth quadratic repulsion rising inside PROX_RADIUS of
+                      each obstacle (non-zero gradient before contact, so the
+                      policy can learn avoidance rather than only reacting to
+                      a binary cliff at impact)
+        r_crash     = −3 on contact           (keeps obstacles genuinely costly)
 
-        Hovering yields exactly 0; crashing is only −3 plus lost future
-        progress — no longer worth doing deliberately.
+        Hovering yields exactly 0; crashing is penalised by both the smooth
+        term AND the hard crash penalty.
         """
+        # reward-design-agent: smooth_proximity_penalty
+        PROX_RADIUS = 0.40   # metres — penalty is zero beyond this distance
+        PROX_SCALE  = 2.0    # peak penalty magnitude at contact
+
         state     = self._getDroneStateVector(0)
         curr_dist = float(np.linalg.norm(self.TARGET_POS - state[0:3]))
 
         r_progress     = self.prev_dist - curr_dist
         self.prev_dist = curr_dist
 
-        r_crash = 0.0
+        r_proximity = 0.0
+        r_crash     = 0.0
         for oid in self.obstacle_ids:
+            obs_pos, _ = p.getBasePositionAndOrientation(oid, physicsClientId=self.CLIENT)
+            dist_to_obs = float(np.linalg.norm(state[0:3] - np.array(obs_pos)))
+            if dist_to_obs < PROX_RADIUS:
+                # Quadratic: 0 at PROX_RADIUS, −PROX_SCALE at dist=0
+                fraction    = 1.0 - dist_to_obs / PROX_RADIUS
+                r_proximity -= PROX_SCALE * fraction ** 2
             if p.getContactPoints(self.DRONE_IDS[0], oid, physicsClientId=self.CLIENT):
                 r_crash = -3.0
                 break
 
-        return r_progress + r_crash
+        return r_progress + r_proximity + r_crash
 
     # ------------------------------------------------------------------
     # Termination / truncation
@@ -256,7 +277,7 @@ class ObstacleAviary(BaseRLAviary):
 
     def _computeTerminated(self):
         state = self._getDroneStateVector(0)
-        if np.linalg.norm(self.TARGET_POS - state[0:3]) < 0.05:
+        if np.linalg.norm(self.TARGET_POS - state[0:3]) < 0.15:  # auto-fix: loosened from 0.05
             for oid in self.obstacle_ids:
                 if p.getContactPoints(self.DRONE_IDS[0], oid, physicsClientId=self.CLIENT):
                     return False

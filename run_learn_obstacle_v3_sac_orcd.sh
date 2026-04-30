@@ -1,0 +1,28 @@
+#!/bin/bash
+#SBATCH --job-name=drone-v3-sac
+#SBATCH --output=logs/%x-%j.out
+#SBATCH --error=logs/%x-%j.err
+#SBATCH --time=24:00:00
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=24G
+#SBATCH --partition=mit_normal
+
+module load deprecated-modules
+module load anaconda3/2022.05-x86_64
+source activate drones
+
+cd ~/gym-pybullet-drones
+mkdir -p logs
+
+python gym_pybullet_drones/examples/learn_obstacle_v3_offpolicy.py \
+  --algo sac \
+  --difficulty 1 \
+  --n_envs 8 \
+  --total_timesteps 12000000 \
+  --batch_size 1024 \
+  --buffer_size 1000000 \
+  --learning_starts 20000 \
+  --learning_rate 2e-4 \
+  --net_arch 512,512,256 \
+  --output_folder ~/drone-results

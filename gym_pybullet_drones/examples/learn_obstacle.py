@@ -1,10 +1,11 @@
 """Training script for ObstacleAviary: fly from origin to goal while avoiding obstacles.
 
-Four-phase curriculum:
+Five-phase curriculum:
   difficulty=0  no obstacles, straight flight (learn basic navigation)
-  difficulty=1  one obstacle off the direct path (easy avoidance)
-  difficulty=2  one obstacle on the direct path (forced detour)
-  difficulty=3  two obstacles in the corridor, randomised each episode
+  difficulty=1  one obstacle 0.10 m off path (easy, narrow miss)
+  difficulty=2  one obstacle 0.05 m off path (nearly centred, small gap)
+  difficulty=3  one obstacle dead-centre on path (forced real detour)
+  difficulty=4  two obstacles in the corridor, randomised each episode
 
 Usage
 -----
@@ -44,10 +45,11 @@ DEFAULT_N_ENVS         = 4
 # Reward thresholds that trigger a difficulty advance.
 # Calibrated for progress-based reward with PID action type.
 # A perfect episode scores ≈ 1.345 (start→goal Euclidean distance).
-# Phase 0 → 1: drone reaches goal reliably in open space    (~82% optimal)
-# Phase 1 → 2: reaches goal around the off-path obstacle    (~67% optimal)
-# Phase 2 → 3: routes around the on-path obstacle           (~52% optimal)
-CURRICULUM_THRESHOLDS = {0: 1.1, 1: 0.9, 2: 0.7}
+# Phase 0 → 1: drone reaches goal reliably in open space          (~82% optimal)
+# Phase 1 → 2: reaches goal around the barely-off-path obstacle   (~74% optimal)
+# Phase 2 → 3: reaches goal around the nearly-centred obstacle    (~67% optimal)
+# Phase 3 → 4: routes around the dead-centre obstacle             (~52% optimal)
+CURRICULUM_THRESHOLDS = {0: 1.1, 1: 0.9, 2: 0.8, 3: 0.7}
 
 
 # ── curriculum callback ────────────────────────────────────────────────────────
@@ -73,9 +75,18 @@ class CurriculumCallback(BaseCallback):
         self.eval_results          = []           # [(timestep, mean_reward), ...]
         self.stability_window      = stability_window
         self.evals_above_threshold = 0            # consecutive evals that beat threshold
+        self._explore_steps_left   = 0            # steps remaining at boosted entropy
 
     # called every training step
     def _on_step(self) -> bool:
+        # decay entropy boost after a phase transition
+        if self._explore_steps_left > 0:
+            self._explore_steps_left -= 1
+            if self._explore_steps_left == 0:
+                self.model.ent_coef = 0.01
+                if self.verbose:
+                    print("[Curriculum] Entropy boost expired, ent_coef → 0.01")
+
         if self.n_calls % self.eval_freq != 0:
             return True
 
@@ -127,14 +138,13 @@ class CurriculumCallback(BaseCallback):
                 os.path.join(self.save_path, f"model_phase_{self.difficulty - 1}_complete")
             )
 
-            # Reset Adam optimizer momentum and set LR to a fixed fine-tuning rate.
-            # Using *= 0.5 would compound across transitions (1e-4→5e-5→2.5e-5),
-            # leaving the policy unable to adapt in later phases.
-            self.model.policy.optimizer.state.clear()
+            # Restore LR to base rate; keep Adam state intact so momentum carries over.
+            # Entropy boost removed: ent_coef=0.05 caused policy collapse at diff 2
+            # by making the policy too stochastic, overwhelming the avoidance gradient.
             for g in self.model.policy.optimizer.param_groups:
-                g["lr"] = 5e-5
+                g["lr"] = 1e-4
             if self.verbose:
-                print(f"[Curriculum] Optimizer state cleared, LR → 5e-05")
+                print(f"[Curriculum] LR → 1e-04")
 
         return True  # returning False would stop training early
 
@@ -147,6 +157,8 @@ def run(
     gui=DEFAULT_GUI,
     total_timesteps=DEFAULT_TOTAL_STEPS,
     n_envs=DEFAULT_N_ENVS,
+    load_model=None,
+    learning_rate=None,
 ):
     # ── output directory ──────────────────────────────────────────────────────
     timestamp = datetime.now().strftime("%m.%d.%Y_%H.%M.%S")
@@ -188,20 +200,35 @@ def run(
         tb_log = None
         print("[WARN] tensorboard not installed — skipping TB logging. Install with: pip install tensorboard")
 
-    model = PPO(
-        "MlpPolicy",
-        train_env,
-        n_steps=512,          # each env collects 512 steps → 512*n_envs samples/update
-        batch_size=128,
-        n_epochs=10,
-        learning_rate=1e-4,   # lowered from 3e-4: smaller steps stay near good regions longer
-        gamma=0.99,           # discount factor — future rewards matter
-        gae_lambda=0.95,      # GAE smoothing parameter
-        clip_range=0.2,       # PPO clip; limits how much the policy can change per step
-        ent_coef=0.01,        # entropy bonus: keeps policy exploring, prevents premature collapse
-        verbose=1,
-        tensorboard_log=tb_log,
-    )
+    if load_model:
+        print(f"[INFO] Loading model from checkpoint: {load_model}")
+        vec_norm_path = os.path.join(os.path.dirname(load_model), "vec_normalize.pkl")
+        if os.path.exists(vec_norm_path):
+            print(f"[INFO] Loading VecNormalize stats from: {vec_norm_path}")
+            train_env = VecNormalize.load(vec_norm_path, train_env.venv)
+            train_env.training = True
+        model = PPO.load(load_model, env=train_env, tensorboard_log=tb_log)
+        model.target_kl = 0.01
+        if learning_rate is not None:
+            for g in model.policy.optimizer.param_groups:
+                g["lr"] = learning_rate
+            print(f"[INFO] Overriding LR → {learning_rate}")
+    else:
+        model = PPO(
+            "MlpPolicy",
+            train_env,
+            n_steps=512,
+            batch_size=128,
+            n_epochs=10,
+            learning_rate=learning_rate if learning_rate is not None else 1e-4,
+            gamma=0.99,
+            gae_lambda=0.95,
+            clip_range=0.2,
+            ent_coef=0.01,
+            target_kl=0.01,
+            verbose=1,
+            tensorboard_log=tb_log,
+        )
 
     # ── curriculum callback ───────────────────────────────────────────────────
     # eval_freq=2000 means we evaluate every 2000 *calls to _on_step*,
@@ -234,8 +261,8 @@ def run(
         steps, rewards = zip(*curriculum_cb.eval_results)
         plt.figure(figsize=(9, 4))
         plt.plot(steps, rewards, marker="o", markersize=3, linewidth=1)
-        colours = ["orange", "red", "darkred"]
-        labels  = ["phase 0→1", "phase 1→2", "phase 2→3"]
+        colours = ["orange", "goldenrod", "red", "darkred"]
+        labels  = ["phase 0→1", "phase 1→2", "phase 2→3", "phase 3→4"]
         for (phase, thresh), colour, label in zip(CURRICULUM_THRESHOLDS.items(), colours, labels):
             plt.axhline(thresh, color=colour, linestyle="--",
                         label=f"{label} threshold ({thresh})")
@@ -248,7 +275,7 @@ def run(
         curve_path = os.path.join(save_dir, "training_curve.png")
         plt.savefig(curve_path, dpi=150)
         print(f"[INFO] Training curve saved to {curve_path}")
-        plt.show()
+        plt.close()
 
     # ── load best model and evaluate ─────────────────────────────────────────
     best_path = os.path.join(save_dir, "best_model.zip")
@@ -315,5 +342,7 @@ if __name__ == "__main__":
     parser.add_argument("--gui",               default=DEFAULT_GUI,           type=str2bool, metavar="")
     parser.add_argument("--total_timesteps",   default=DEFAULT_TOTAL_STEPS,   type=float,    metavar="")
     parser.add_argument("--n_envs",            default=DEFAULT_N_ENVS,        type=int,      metavar="")
+    parser.add_argument("--load_model",        default=None,                  type=str,      metavar="")
+    parser.add_argument("--learning_rate",     default=None,                  type=float,    metavar="")
     args = parser.parse_args()
     run(**vars(args))
