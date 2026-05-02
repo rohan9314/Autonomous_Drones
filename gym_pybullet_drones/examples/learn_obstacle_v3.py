@@ -4,8 +4,8 @@ Key differences from v2:
   - Uses ObstacleAviaryV3: sequential N-waypoint task
   - Curriculum metric: fraction_completed (continuous) not binary success
   - Difficulty simultaneously advances obstacle count and waypoint count
-  - Advance threshold: mean fraction_completed > 0.85 for 3 checks
-  - Retreat threshold: mean fraction_completed < 0.35 for 2 checks
+  - Advance threshold: mean fraction_completed > 0.75 for 3 checks
+  - Retreat threshold: mean fraction_completed < 0.40 for 2 checks
 
 Usage:
     python learn_obstacle_v3.py                              # default: 8M steps, diff 1
@@ -45,8 +45,8 @@ DEFAULT_BATCH_SIZE    = 512
 DEFAULT_NET_ARCH      = "256,256,128"
 
 # Curriculum thresholds on fraction_completed (continuous 0–1)
-ADVANCE_THRESHOLD = 0.85   # advance when rolling mean fraction > this
-RETREAT_THRESHOLD = 0.35   # retreat when rolling mean fraction < this
+ADVANCE_THRESHOLD = 0.75   # advance when rolling mean fraction > this (was 0.85)
+RETREAT_THRESHOLD = 0.40   # retreat when rolling mean fraction < this (was 0.35)
 ADVANCE_CONSEC    = 3      # consecutive eval periods required to advance
 RETREAT_CONSEC    = 2      # consecutive eval periods required to retreat
 MAX_DIFFICULTY    = 4
@@ -61,8 +61,8 @@ class CurriculumCallbackV3(BaseCallback):
     fraction_completed = current_wp_idx / n_waypoints at episode end.
 
     Curriculum rules:
-      - Advance when rolling mean fraction_completed > 0.85 for 3 consecutive checks.
-      - Retreat when rolling mean fraction_completed < 0.35 for 2 consecutive checks
+      - Advance when rolling mean fraction_completed > 0.75 for 3 consecutive checks.
+      - Retreat when rolling mean fraction_completed < 0.40 for 2 consecutive checks
         (minimum difficulty = 0, but training starts at 1 by default).
     """
 
@@ -94,8 +94,8 @@ class CurriculumCallbackV3(BaseCallback):
         for done, info in zip(dones, infos):
             if done:
                 frac = info.get("fraction_completed", 0.0)
-                # Treat binary success as fraction = 1.0 if present and fraction missing
-                if frac == 0.0 and info.get("success", False):
+                # Success always means fraction = 1.0 regardless of pointer position
+                if info.get("success", False):
                     frac = 1.0
                 self.episode_fractions.append(frac)
 
@@ -215,7 +215,7 @@ def run(
             train_env = VecNormalize.load(vec_norm_path, train_env.venv)
             train_env.training = True
         model = PPO.load(load_model, env=train_env, tensorboard_log=tb_log)
-        model.target_kl = 0.01
+        model.target_kl = 0.02
         if learning_rate is not None:
             for g in model.policy.optimizer.param_groups:
                 g["lr"] = learning_rate
@@ -232,7 +232,7 @@ def run(
             gae_lambda=0.95,
             clip_range=0.2,
             ent_coef=0.005,
-            target_kl=0.01,
+            target_kl=0.02,
             policy_kwargs=dict(net_arch=net_arch_list),
             verbose=1,
             tensorboard_log=tb_log,
