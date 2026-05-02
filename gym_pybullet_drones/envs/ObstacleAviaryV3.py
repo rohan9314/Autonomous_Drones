@@ -408,7 +408,11 @@ class ObstacleAviaryV3(BaseRLAviary):
         # Lateral unit vector: 90° CCW in horizontal plane
         lat = np.array([-goal_unit[1], goal_unit[0], 0.0])
         lat_norm = np.linalg.norm(lat)
-        lat = lat / lat_norm if lat_norm > 1e-6 else lat
+        if lat_norm < 1e-6:
+            # Goal points straight up or down — lateral direction is undefined.
+            # Return all-clear so we don't send zero-length rays to rayTestBatch (causes hang).
+            return np.ones(3, dtype=np.float32)
+        lat = lat / lat_norm
 
         froms = [drone_pos.tolist()] * 3
         tos   = [
