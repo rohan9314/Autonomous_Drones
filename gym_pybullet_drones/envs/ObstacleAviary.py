@@ -239,6 +239,10 @@ class ObstacleAviary(BaseRLAviary):
         # Moderate time penalty — encourages speed without destabilizing
         reward -= 0.02
 
+        # Proximity reward — when very close, reward staying close to stop orbiting
+        if dist < 0.5:
+            reward += 0.5 * (0.5 - dist)
+
         # Terminal bonuses/penalties
         if dist < self.TARGET_RADIUS:
             # Early completion bonus: more reward for finishing faster
